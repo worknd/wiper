@@ -1,4 +1,4 @@
-#!/opt/bin/bash
+#!/usr/bin/env bash
 #
 # SATA SSD free-space TRIM utility, by Mark Lord <mlord@pobox.com>
 
@@ -89,7 +89,7 @@ function find_prog(){
 		prog="$p"
 		[ $verbose -gt 0 ] && echo "  --> using $prog instead of $1" >&2
 	fi
-	echo "$prog"
+	echo -n "$prog"
 }
 
 ## Ensure we have most of the necessary utilities available before trying to proceed:
@@ -99,7 +99,6 @@ HDPARM=$(find_prog /opt/sbin/hdparm)	|| exit 1
 FIND=$(find_prog /usr/bin/find)		|| exit 1
 STAT=$(find_prog /bin/stat)		|| exit 1
 GAWK=$(find_prog /opt/bin/gawk)		|| exit 1
-BLKID=$(find_prog /sbin/blkid)		|| exit 1
 GREP=$(find_prog /bin/grep)		|| exit 1
 LS=$(find_prog /bin/ls)			|| exit 1
 DF=$(find_prog /bin/df)			|| exit 1
@@ -109,7 +108,7 @@ RM=$(find_prog /bin/rm)			|| exit 1
 
 ## I suppose this will confuse the three SELinux users out there:
 ##
-if [ $UID -ne 0 ]; then
+if [ $EUID -ne 0 ]; then
 	echo "Only the super-user can use this (try \"sudo $0\" instead), aborting." >&2
 	exit 1
 fi
@@ -152,7 +151,7 @@ function get_realpath(){
 		## Otherwise, prefix $p with the cwd path and print it:
 		elif [ -e "$p" ]; then
 			[ "${p:0:1}" = "/" ] || p="$(pwd -P)/$p"
-			echo "$p"
+			echo -n "$p"
 			exit
 		fi
 		iter=$((iter + 1))
@@ -166,13 +165,13 @@ function get_devpath(){
 	major=$((0x${kdev:0:2}))
 	minor=$((0x${kdev:2:2}))
 	$FIND /dev -xdev -type b -exec $LS -ln {} \; | $GAWK -v major="$major," -v minor="$minor" \
-		'($5 == major && $6 == minor){r=$NF}END{print r}'
+		'{if ($5 == major && $6 == minor) {print $NF;exit}}'
 }
 
 ## Convert "$arg" into an absolute pathname target, with no symlinks or embedded blanks:
 target=$(get_realpath "$arg")
 if [ "$target" = "" ]; then
-	[ "$arg" = "/dev/root" ] && target=$(get_devpath "/")
+	[ "$arg" = "/dev/root" ] && target=$(get_devpath /)
 	if [ "$target" = "" ]; then
 		echo "$arg: unable to determine full pathname, aborting." >&2
 		exit 1
@@ -210,8 +209,7 @@ function get_fsdir(){
 				r="${m[1]}"
 			fi
 		fi
-		#echo "$pdev ${m[1]} ${m[2]} ${m[3]}"
-	done
+	done < /proc/mounts
 	echo -n "$r"
 }
 
@@ -220,7 +218,7 @@ function get_fsdir(){
 ## one from the last occurance in the list from /proc/mounts.
 ##
 function get_fsdev(){   ## from fsdir
-	get_realpath $($GAWK -v p="$1" '{if ($2 == p) r=$1} END{print r}' < /proc/mounts)
+	get_realpath $($GAWK -v p="$1" '{if ($2 == p) {print $1;exit}}' < /proc/mounts)
 }
 
 ## Find the r/w or r/o status (fsmode) of a filesystem mount point  ($1: fsdir)
@@ -228,11 +226,11 @@ function get_fsdev(){   ## from fsdir
 ## and convert it to a longer human-readable string.
 ##
 function get_fsmode(){  ## from fsdir
-	mode=$($GAWK -v p="$1" '{if ($2 == p) r=substr($4,1,2)} END{print r}' < /proc/mounts)
+	mode=$($GAWK -v p="$1" '{if ($2 == p) {print substr($4,1,2);exit}}' < /proc/mounts)
 	if [ "$mode" = "ro" ]; then
-		echo "read-only"
+		echo -n "read-only"
 	elif [ "$mode" = "rw" ]; then
-		echo "read-write"
+		echo -n "read-write"
 	else
 		echo "$fsdir: unable to determine mount status, aborting." >&2
 		exit 1
@@ -327,13 +325,13 @@ if [ "$method" = "offline" ]; then
 	## We might already have fsdev/fsdir from above; if not, we need to find them.
 	if [ "$fsdev" = "" -o "$fsdir" = "" ]; then
 		fsdev="$target"
-		fsdir=$(get_fsdir "$fsdev" < /proc/mounts)
+		fsdir=$(get_fsdir $fsdev)
 		## More weirdness for /dev/root in /proc/mounts:
 		if [ "$fsdir" = "" -a "$fsdev" = "$rootdev" ]; then
-			fsdir=$(get_fsdir /dev/root < /proc/mounts)
+			fsdir=$(get_fsdir /dev/root)
 			if [ "$fsdir" = "" ]; then
-				rdev=$(get_devpath "/")
-				[ "$rdev" != "" ] && fsdir=$(get_fsdir "$rdev" < /proc/mounts)
+				rdev=$(get_devpath /)
+				[ "$rdev" != "" ] && fsdir=$(get_fsdir $rdev)
 			fi
 		fi
 	fi
@@ -355,7 +353,7 @@ fi
 ## Use $LS to find the major number of a block device:
 ##
 function get_major(){
-	$LS -ln "$1" | $GAWK '{print gensub(",","",1,$5)}'
+	$LS -gn "$1" | $GAWK '{print gensub(",","",1,$4)}'
 }
 
 ## At this point, we have finalized our selection of online vs. offline,
@@ -365,57 +363,53 @@ function get_major(){
 ## Then determine whether or not rawdev claims support for TRIM commands.
 ## Note that some devices lie about support, and later reject the TRIM commands.
 ##
-rawdev=$(echo $fsdev | $GAWK '{print gensub("[0-9]*$","","g")}')
-rawdev=$(get_realpath $rawdev)
-if [ ! -e "$rawdev" ]; then
-	rawdev=""
-elif [ ! -b "$rawdev" ]; then
-	rawdev=""
-elif [ $(get_major $fsdev) -ne $(get_major $rawdev) ]; then  ## sanity check
-	rawdev=""
-else
-	## "SCSI" drives only; no LVM confusion for now:
-	maj="$(get_major $fsdev)"
-	maj_ok=0
-	for scsi_major in 8 65 66 67 68 69 70 71 ; do
-		[ "$maj" = "$scsi_major" ] && maj_ok=1
-	done
-	if [ $maj_ok -eq 0 ]; then
-		echo "$rawdev: does not appear to be a SCSI/SATA SSD, aborting." >&2
-		exit 1
+rawdev=
+maj=$(get_major $fsdev)
+for p in $($LS /sys/block/); do
+	rdev="/dev/$p"
+	if [ -b $rdev -a $maj -eq $(get_major $rdev) ]; then
+		rawdev=$rdev
+		break
 	fi
-	if ! $HDPARM -I $rawdev | $GREP -qiE '^[[:blank:]]+\*[[:blank:]]+Data Set Management TRIM supported'; then
-		if [ "$commit" = "yes" ]; then
-			echo "$rawdev: DSM/TRIM command not supported, aborting." >&2
-			exit 1
-		fi
-		echo "$rawdev: DSM/TRIM command not supported (continuing with dry-run)." >&2
-	fi
-fi
-if [ "$rawdev" = "" ]; then
+done
+if [ -z "$rawdev" ]; then
 	echo "$fsdev: unable to reliably determine the underlying physical device name, aborting" >&2
 	exit 1
 fi
 
-## We also need to know the offset of fsdev from the beginning of rawdev,
-## because TRIM requires absolute sector numbers within rawdev:
-##
-fsoffset=$($HDPARM -g "$fsdev" | $GAWK 'END {print $NF}')
+## "SCSI" drives only; no LVM confusion for now:
+maj_ok=0
+for scsi_major in 8 65 66 67 68 69 70 71 ; do
+	[ $maj -eq $scsi_major ] && maj_ok=1
+done
+if [ $maj_ok -eq 0 ]; then
+	echo "$rawdev: does not appear to be a SCSI/SATA SSD, aborting." >&2
+#	exit 1
+fi
+
+if ! $HDPARM -I $rawdev | $GREP -qsiE '^[[:blank:]]+\*[[:blank:]]+Data Set Management TRIM supported'; then
+	if [ "$commit" = "yes" ]; then
+		echo "$rawdev: DSM/TRIM command not supported, aborting." >&2
+		exit 1
+	fi
+	echo "$rawdev: DSM/TRIM command not supported (continuing with dry-run)." >&2
+fi
 
 ## Next step is to determine what type of filesystem we are dealing with (fstype):
 ##
 if [ "$fsdir" = "" ]; then
 	## Not mounted: use $BLKID to determine the fstype of fsdev:
+	BLKID=$(find_prog /sbin/blkid) || exit 1
 	fstype=$($BLKID -w /dev/null -c /dev/null $fsdev 2>/dev/null | \
 		 $GAWK '/ TYPE=".*"/{sub("^.* TYPE=\"",""); sub("[\" ][\" ]*.*$",""); print}')
 	[ $verbose -gt 0 ] && echo "$fsdev: fstype=$fstype"
 else
 	## Mounted: we could just use $BLKID here, too, but it's safer to use /proc/mounts directly:
-	fstype=$($GAWK -v p="$fsdir" '{if ($2 == p) r=$3} END{print r}' < /proc/mounts)
+	fstype=$($GAWK -v p="$fsdir" '{if ($2 == p) {print $3;exit}}' < /proc/mounts)
 	[ $verbose -gt 0 ] && echo "$fsdir: fstype=$fstype"
 fi
 if [ "$fstype" = "" ]; then
-	echo "$fsdev: unable to determine filesystem type, aborting." >&2
+	echo "$target: unable to determine filesystem type, aborting." >&2
 	exit 1
 fi
 
@@ -452,7 +446,7 @@ if [ "$method" = "online" ]; then
 
 	## Figure out if we have enough free space to even attempt TRIM:
 	##
-	freesize=$($DF -P -B 1024 . | $GAWK '{r=$4}END{print r}')
+	freesize=$($DF -P -B 1024 $fsdev | $GAWK '{r=$4}END{print r}')
 	if [ "$freesize" = "" ]; then
 		echo "$fsdev: unknown to '$DF'"
 		exit 1
@@ -469,12 +463,17 @@ if [ "$method" = "online" ]; then
 	##
 	reserved=$((freesize / 10000))
 	[ $reserved -lt 4096 ] && reserved=4096
-	reserved=1024
 	[ $verbose -gt 0 ] && echo "freesize = ${freesize} KB, reserved = ${reserved} KB"
 	tmpsize=$((freesize - reserved))
 	tmpfile="$fsdir/${0##*/}_$$.tmp"
+	[ "$fsdir" = "/" ] && tmpfile=${tmpfile//\/\//\/}
 	get_trimlist="$HDPARM --fibmap $tmpfile"
 else
+	## We also need to know the offset of fsdev from the beginning of rawdev,
+	## because TRIM requires absolute sector numbers within rawdev:
+	##
+	fsoffset=$($HDPARM -g "$fsdev" | $GAWK 'END {print $NF}')
+
 	## We can only do offline TRIM on filesystems that we "know" about here.
 	## Currently, this includes the ext2/3/4 family, xfs, and reiserfs.
 	## The first step for any of these is to ensure that the filesystem is "clean",
@@ -483,7 +482,7 @@ else
 	get_trimlist=""
 	if [ "$fstype" = "ext2" -o "$fstype" = "ext3" -o "$fstype" = "ext4" ]; then
 		DUMPE2FS=$(find_prog /sbin/dumpe2fs) || exit 1
-		fstate=$($DUMPE2FS "$fsdev" 2>/dev/null | $GAWK '/^[Ff]ilesystem state:/{print $NF}' 2>/dev/null)
+		fstate=$($DUMPE2FS -h "$fsdev" 2>/dev/null | $GAWK '/^[Ff]ilesystem state:/{print $NF}' 2>/dev/null)
 		if [ "$fstate" != "clean" ]; then
 			echo "$target: filesystem not clean, please run \"e2fsck $fsdev\" first, aborting." >&2
 			exit 1
@@ -525,7 +524,7 @@ else
 		get_trimlist="xfs_trimlist"
 	elif [ "$fstype" = "reiserfs" ]; then
 		DEBUGREISERFS=$(find_prog /sbin/debugreiserfs) || exit 1
-		( $DEBUGREISERFS $fsdev | $GREP '^Filesystem state:.consistent' ) &> /dev/null
+		( $DEBUGREISERFS $fsdev | $GREP -qs '^Filesystem state:.consistent' ) &> /dev/null
 		if [ $? -ne 0 ]; then
 			echo "Please run fsck.reiserfs first, aborting." >&2
 			exit 1
@@ -536,24 +535,24 @@ else
 		TR=$(find_prog /usr/bin/tr) || exit 1
 		#check sleuthkit
 		FSSTAT=$(find_prog /usr/local/bin/fsstat)
-		if [ "$?" = "1" ]; then
-			echo "fsstat and icat from package sleuthkit >= 3.1.1 is required for hfsplus."
+		if ! $FSSTAT -f list 2>/dev/stdout | $GREP -qs 'HFS+'; then
+			echo "fsstat and icat from package sleuthkit >= 3.1.1 is required for hfsplus." >&2
 			exit 1
 		fi
 		ICAT=$(find_prog /usr/local/bin/icat)
-		if [ $($ICAT -f list 2>/dev/stdout | $GREP HFS+) = "" ]; then
-                        echo "Wrong icat, version from package sleuthkit >= 3.1.1 is required for hfsplus."
-                        exit 1
-                fi
+		if ! $ICAT -f list 2>/dev/stdout | $GREP -qs 'HFS+'; then
+			echo "Wrong icat, version from package sleuthkit >= 3.1.1 is required for hfsplus." >&2
+			exit 1
+		fi
 		#check for unmounted properly
-		if [ $($FSSTAT -f hfs $fsdev | $GREP "Volume Unmounted Properly") = ""  ]; then
+		if ! $FSSTAT -f hfs $fsdev | $GREP -qs 'Volume Unmounted Properly'; then
 			echo "Hfsplus volume unmounted improperly!"
 			exit 1
 		fi
 		#check $AllocationFile inode
 		FFIND=$(find_prog /usr/local/bin/ffind)
 		if [ $($FFIND -f hfs $fsdev 6) != "/\$AllocationFile" ]; then
-			echo "Hfsplus bitmap \$AllocationFile is not inode 6!"
+			echo "Hfsplus bitmap \$AllocationFile is not inode 6!" >&2
 			exit 1
 		fi
 		#get offset for hfsplus with a wrapper
@@ -580,14 +579,13 @@ else
 		OD=$(find_prog /usr/bin/od) || exit 1
 		TR=$(find_prog /usr/bin/tr) || exit 1
 		#check for unmounted properly
-		$NTFSPROBE -w $fsdev 2>/dev/null
-		if [ $? -ne 0 ]; then
-			echo "$fsdev contains an unclean file system!"
+		if ! $NTFSPROBE -w $fsdev 2>/dev/null; then
+			echo "$fsdev contains an unclean file system!" >&2
 			exit 1
 		fi
 		#check for volume version
-		if [ $($NTFSINFO -m -f $fsdev | $GREP "Volume Version: 3.1") = "" ]; then
-			echo "NTFS volume version must be 3.1!"
+		if ! $NTFSINFO -m -f $fsdev | $GREP -qs "Volume Version: 3.1"; then
+			echo "NTFS volume version must be 3.1!" >&2
 			exit 1
 		fi
 		blksize=$($NTFSINFO -m -f $fsdev | $GREP "Cluster Size: " | $TR -d "\t")
@@ -800,11 +798,11 @@ GAWKPROG='
 		blksects = $NF / 512
 		next
 	}
-	/^Group [0-9][0-9]*:/ {	## Second stage output from dumpe2fs:
+	/^Group [1-9][0-9]*:/ {	## Second stage output from dumpe2fs:
 		in_groups = 1
 		next
 	}
-	/^ *Free blocks: [0-9]/	{ ## Bulk of output from dumpe2fs:
+	/^ *Free blocks: [1-9]/	{ ## Bulk of output from dumpe2fs:
 		if (blksects && in_groups) {
 			n = split(substr($0,16),f,",*  *")
 			for (i = 1; i <= n; ++i) {
@@ -850,13 +848,13 @@ GAWKPROG='
 	END {
 		if (verbose > 1)
 			printf "\n" > "/dev/stderr"
-		if (err == 0 && commit != "yes")
+		if (commit != "yes")
 			printf "(dry-run) trimming %u sectors from %u ranges\n", nsectors, nranges > "/dev/stderr"
-		exit err
 	}'
 ## End gawk program
 
-ret=$($get_trimlist 2>/dev/null | $GAWK		\
+set -e
+out=$($get_trimlist 2>/dev/null | $GAWK		\
 	-v commit="$commit"			\
 	-v method="$method"			\
 	-v rawdev="$rawdev"			\
@@ -865,11 +863,11 @@ ret=$($get_trimlist 2>/dev/null | $GAWK		\
 	-v xfs_blksects="$xfs_blksects"		\
 	-v xfs_agoffsets="$xfs_agoffsets"	\
 	"$GAWKPROG" | $TRIM)
-rc=$?
+ret=$?
 
-if [ $rc -eq 0 ]; then
-	bytes=$(echo "$ret" | $GAWK '/trimming/ {nsec += $2} END{print nsec * 512}')
-	echo "Trimming $bytes bytes"
+if [ $ret -eq 0 ] && [ "$commit" = "yes" ]; then
+	bytes=$(echo -n "$out" | $GAWK '/trimming/ {nsec += $2} END{print nsec * 512}')
+	echo "$fsdev: trimmed $bytes bytes"
 fi
 
-do_cleanup $rc
+do_cleanup $ret
